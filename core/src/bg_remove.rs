@@ -190,12 +190,14 @@ impl InferenceState {
                 .lock()
                 .map_err(|_| "inference session lock was poisoned".to_string())?;
             if let Some(free) = pool.get_mut(key) {
-                // Sessions built for another parallelism level are dropped
-                // here, freeing their memory.
-                while let Some(candidate) = free.pop() {
-                    if candidate.threads == threads && candidate.gpu == gpu {
-                        return Ok(candidate);
-                    }
+                // Free sessions for the same device but another thread
+                // split (a different "Images at once") are dropped here,
+                // freeing their memory. Sessions for the *other* device are
+                // left alone: with the CPU working alongside the GPU, both
+                // kinds sit in the pool and must not evict each other.
+                free.retain(|s| s.gpu != gpu || s.threads == threads);
+                if let Some(at) = free.iter().position(|s| s.gpu == gpu) {
+                    return Ok(free.swap_remove(at));
                 }
             }
         }
@@ -211,7 +213,8 @@ impl InferenceState {
     fn give_back(&self, key: &str, session: PooledSession, keep: usize) {
         if let Ok(mut pool) = self.pool.lock() {
             let free = pool.entry(key.to_string()).or_default();
-            if free.len() < keep.max(1) {
+            let same_device = free.iter().filter(|s| s.gpu == session.gpu).count();
+            if same_device < keep.max(1) {
                 free.push(session);
             }
         }
