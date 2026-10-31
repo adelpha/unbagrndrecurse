@@ -222,6 +222,20 @@ pub async fn set_theme(app: AppHandle, theme: String) -> Result<Settings, String
 }
 
 #[tauri::command]
+pub async fn set_use_gpu(app: AppHandle, use_gpu: bool) -> Result<Settings, String> {
+    let settings = settings::set_use_gpu(&app, use_gpu).await?;
+    app.state::<InferenceState>().set_use_gpu(settings.use_gpu);
+    Ok(settings)
+}
+
+/// Points the inference pool at the device chosen in Settings, before a run.
+fn apply_device_setting(app: &AppHandle) -> Result<(), String> {
+    let use_gpu = settings::load_settings(app)?.use_gpu;
+    app.state::<InferenceState>().set_use_gpu(use_gpu);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_export_format(app: AppHandle, format: String) -> Result<Settings, String> {
     settings::set_export_format(&app, &format).await
 }
@@ -265,6 +279,7 @@ pub async fn remove_background_single(
     let spec = resolve_model(&app, model_key.as_deref())?;
     let format = resolve_export_format(&app, export_format.as_deref())?;
     let model_path = models::ensure_model(&app, spec).await?;
+    apply_device_setting(&app)?;
     let input_path_buf = PathBuf::from(&input_path);
     let output_path = output_path_for(&app, &input_path_buf, output_dir.as_deref(), "-nobg", &format)?;
 
@@ -622,7 +637,14 @@ pub struct BatchOptions {
     /// batch. Empty/`None` means `{name}-nobg` (or `{name}-bg` when a
     /// background or shadow is applied).
     pub name_template: Option<String>,
+    /// How many images to process side by side (each on its share of the
+    /// CPU cores). `None` means 1, the original one-at-a-time behaviour.
+    pub parallel: Option<usize>,
 }
+
+/// Upper bound for [`BatchOptions::parallel`]: each extra worker holds its
+/// own copy of the model in memory.
+const MAX_BATCH_PARALLEL: usize = 8;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -688,6 +710,7 @@ pub async fn remove_background_batch(
     let spec = resolve_model(&app, model_key.as_deref())?;
     let format = resolve_export_format(&app, export_format.as_deref())?;
     let model_path = models::ensure_model(&app, spec).await?;
+    apply_device_setting(&app)?;
     let given = input_paths.len();
     let expanded = expand_paths(&input_paths, false, None)?;
     let subdirs: Vec<String> = match subdirs {
@@ -715,7 +738,26 @@ pub async fn remove_background_batch(
     let mut processed = 0;
     let mut cancelled = false;
 
+    let parallel = options.parallel.unwrap_or(1).clamp(1, MAX_BATCH_PARALLEL);
+    // Up to `parallel` files in flight at once; output paths are still
+    // planned here, in batch order, so de-duplicated names don't depend on
+    // which file happens to finish first.
+    let mut running: tokio::task::JoinSet<(usize, String, BatchFileResult)> =
+        tokio::task::JoinSet::new();
+    let emit = |position: usize, file_name: String, result: BatchFileResult| {
+        let _ = app.emit(
+            "batch-progress",
+            BatchProgressEvent { index: position, total, file_name, result },
+        );
+    };
+
     for ((raw_input_path, position), subdir) in input_paths.into_iter().zip(positions).zip(subdirs) {
+        while running.len() >= parallel {
+            if let Some(Ok((position, file_name, result))) = running.join_next().await {
+                processed += 1;
+                emit(position, file_name, result);
+            }
+        }
         if cancel.0.load(Ordering::SeqCst) {
             cancelled = true;
             break;
@@ -737,68 +779,69 @@ pub async fn remove_background_batch(
                 .map(|path| unique_output_path(path, &mut taken))
         });
 
-        let file_result = match planned {
-            Err(message) => BatchFileResult::Error { message },
-            Ok(output_path) => {
-                let app = app.clone();
-                let model_path = model_path.clone();
-                let raw_input_path = raw_input_path.clone();
-                let format = format.clone();
-                let options = options.clone();
-                let outcome = tauri::async_runtime::spawn_blocking(
-                    move || -> Result<(PathBuf, String), String> {
-                        let original = open_image(&app, &raw_input_path)?;
-                        let inference = app.state::<InferenceState>();
-                        let mut result = bg_remove::remove_background(
-                            inference.inner(),
-                            spec,
-                            &model_path,
-                            &original,
-                        )?;
-                        if compositing {
-                            result = background::composite(
-                                &result,
-                                options.background_hex.as_deref(),
-                                options.shadow.as_ref(),
-                            )?;
-                        }
-                        if let Some(parent) = output_path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                format!("could not create folder {}: {e}", parent.display())
-                            })?;
-                        }
-                        write_output(&result, &output_path, &format)?;
-                        publish_to_gallery(&app, &output_path, &format);
-                        let after_data_url = to_data_url_sized(
-                            &DynamicImage::ImageRgba8(result),
-                            BATCH_THUMB_MAX_DIM,
-                        )?;
-                        Ok((output_path, after_data_url))
-                    },
-                )
-                .await
-                .map_err(|e| format!("background task failed: {e}"));
-
-                match outcome {
-                    Ok(Ok((output_path, after_data_url))) => BatchFileResult::Done {
-                        output_path: output_path.display().to_string(),
-                        after_data_url,
-                    },
-                    Ok(Err(message)) | Err(message) => BatchFileResult::Error { message },
-                }
+        let output_path = match planned {
+            Ok(path) => path,
+            Err(message) => {
+                processed += 1;
+                emit(position, file_name, BatchFileResult::Error { message });
+                continue;
             }
         };
 
-        processed += 1;
-        let _ = app.emit(
-            "batch-progress",
-            BatchProgressEvent {
-                index: position,
-                total,
-                file_name,
-                result: file_result,
-            },
-        );
+        let app = app.clone();
+        let model_path = model_path.clone();
+        let format = format.clone();
+        let options = options.clone();
+        running.spawn_blocking(move || {
+            let outcome = (|| -> Result<(PathBuf, String), String> {
+                let original = open_image(&app, &raw_input_path)?;
+                let inference = app.state::<InferenceState>();
+                let mut result = bg_remove::remove_background_parallel(
+                    inference.inner(),
+                    spec,
+                    &model_path,
+                    &original,
+                    parallel,
+                )?;
+                if compositing {
+                    result = background::composite(
+                        &result,
+                        options.background_hex.as_deref(),
+                        options.shadow.as_ref(),
+                    )?;
+                }
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        format!("could not create folder {}: {e}", parent.display())
+                    })?;
+                }
+                write_output(&result, &output_path, &format)?;
+                publish_to_gallery(&app, &output_path, &format);
+                let after_data_url =
+                    to_data_url_sized(&DynamicImage::ImageRgba8(result), BATCH_THUMB_MAX_DIM)?;
+                Ok((output_path, after_data_url))
+            })();
+            let result = match outcome {
+                Ok((output_path, after_data_url)) => BatchFileResult::Done {
+                    output_path: output_path.display().to_string(),
+                    after_data_url,
+                },
+                Err(message) => BatchFileResult::Error { message },
+            };
+            (position, file_name, result)
+        });
+    }
+
+    // Let whatever is already running finish (also after a cancel: those
+    // files are part-way through and their results are worth keeping).
+    while let Some(joined) = running.join_next().await {
+        match joined {
+            Ok((position, file_name, result)) => {
+                processed += 1;
+                emit(position, file_name, result);
+            }
+            Err(e) => return Err(format!("background task failed: {e}")),
+        }
     }
 
     Ok(BatchSummary { processed, cancelled })

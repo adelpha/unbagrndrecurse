@@ -22,6 +22,14 @@ pub struct Settings {
     /// output is saved in (see [`crate::commands::write_output`]).
     #[serde(default = "default_export_format")]
     pub export_format: String,
+    /// Run the model on the GPU (DirectML) where available - Windows only;
+    /// ignored elsewhere. Falls back to the CPU on its own if the GPU fails.
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
+}
+
+fn default_use_gpu() -> bool {
+    true
 }
 
 fn default_export_format() -> String {
@@ -34,6 +42,7 @@ impl Default for Settings {
             selected_model: DEFAULT_MODEL_KEY.to_string(),
             theme: "system".to_string(),
             export_format: default_export_format(),
+            use_gpu: default_use_gpu(),
         }
     }
 }
@@ -101,6 +110,13 @@ pub async fn set_theme(app: &AppHandle, theme: &str) -> Result<Settings, String>
     }
     let mut settings = load_settings(app)?;
     settings.theme = theme.to_string();
+    save(app, &settings).await?;
+    Ok(settings)
+}
+
+pub async fn set_use_gpu(app: &AppHandle, use_gpu: bool) -> Result<Settings, String> {
+    let mut settings = load_settings(app)?;
+    settings.use_gpu = use_gpu;
     save(app, &settings).await?;
     Ok(settings)
 }

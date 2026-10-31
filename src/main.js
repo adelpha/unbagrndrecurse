@@ -49,6 +49,7 @@ const settingsOverlay = $("settings-overlay");
 const settingsCloseBtn = $("settings-close-btn");
 const themeSelect = $("theme-select");
 const exportFormatSelect = $("export-format-select");
+const useGpuToggle = $("use-gpu-toggle");
 const settingsModelList = $("settings-model-list");
 const clearAllModelsBtn = $("clear-all-models-btn");
 
@@ -137,6 +138,7 @@ const batchDropzone = $("batch-dropzone");
 const batchPickFilesBtn = $("batch-pick-files-btn");
 const batchPickFolderBtn = $("batch-pick-folder-btn");
 const batchRecursiveInput = $("batch-recursive");
+const batchParallelSelect = $("batch-parallel");
 const batchResult = $("batch-result");
 const batchProgressFill = $("batch-progress-fill");
 const batchProgressLabel = $("batch-progress-label");
@@ -631,6 +633,18 @@ exportFormatSelect.addEventListener("change", async () => {
   } catch (err) {
     exportFormat = previous;
     exportFormatSelect.value = previous;
+    setStatus(`Failed: ${err}`);
+  }
+});
+
+// DirectML is Windows-only; there's nothing to switch elsewhere.
+if (!/Windows/i.test(navigator.userAgent)) $("settings-performance").hidden = true;
+
+useGpuToggle.addEventListener("change", async () => {
+  try {
+    await invoke("set_use_gpu", { useGpu: useGpuToggle.checked });
+  } catch (err) {
+    useGpuToggle.checked = !useGpuToggle.checked;
     setStatus(`Failed: ${err}`);
   }
 });
@@ -1670,6 +1684,7 @@ function readBatchOptions() {
         }
       : null,
     nameTemplate: batchNameTemplateInput.value.trim() || null,
+    parallel: Number(batchParallelSelect.value) || 1,
   };
 }
 
@@ -2184,6 +2199,7 @@ async function init() {
     themeSelect.value = settings.theme;
     exportFormat = settings.exportFormat;
     exportFormatSelect.value = settings.exportFormat;
+    useGpuToggle.checked = settings.useGpu ?? true;
     populateModelSelect();
     renderModelBar();
     setStatus("Ready.");

@@ -42,3 +42,10 @@ hex = "0.4"
 [target.'cfg(target_os = "android")'.dependencies]
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "tls12"] }
 webpki-roots = "0.26"
+
+# GPU inference on Windows through DirectML: works on any DirectX 12 GPU
+# (NVIDIA, AMD, Intel) without CUDA. The prebuilt Windows ONNX Runtime
+# already ships with DirectML (DirectML.dll next to the exe); this feature
+# only adds ort's bindings for turning it on.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.13", features = ["directml"] }

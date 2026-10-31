@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use image::{imageops::FilterType, ImageBuffer, Luma, Rgba, RgbaImage};
@@ -17,11 +18,27 @@ use ort::value::TensorRef;
 
 use crate::models::{ModelSpec, OutputMode};
 
-/// Holds lazily-built inference sessions, one per model the user has used
-/// this run. `ort` allows only one environment per process, and a `Session`
-/// isn't safe to `run()` concurrently from multiple threads, so every
-/// inference call goes through this single mutex-guarded map.
-pub struct InferenceState(Mutex<HashMap<String, Session>>);
+/// A pool of lazily-built inference sessions, per model. A `Session` isn't
+/// safe to `run()` from several threads at once, so each inference call
+/// takes a session out of the pool for its own exclusive use (building one
+/// if none is free) and hands it back afterwards. That lets a batch run
+/// several images side by side, each on its own session with its share of
+/// the CPU cores, while a lone call gets one session using every core.
+pub struct InferenceState {
+    pool: Mutex<HashMap<String, Vec<PooledSession>>>,
+    /// Run on the GPU (DirectML, Windows only) when possible.
+    use_gpu: AtomicBool,
+}
+
+struct PooledSession {
+    /// Built with the GPU execution provider (see [`InferenceState::set_use_gpu`]).
+    gpu: bool,
+    /// Intra-op threads the session was built with. A session built for a
+    /// different level of parallelism is dropped rather than reused, so
+    /// N side-by-side sessions never oversubscribe the cores.
+    threads: usize,
+    session: Session,
+}
 
 impl Default for InferenceState {
     fn default() -> Self {
@@ -31,8 +48,68 @@ impl Default for InferenceState {
 
 impl InferenceState {
     pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
+        Self { pool: Mutex::new(HashMap::new()), use_gpu: AtomicBool::new(true) }
     }
+
+    /// Whether new inference sessions should run on the GPU. Only has an
+    /// effect on Windows (DirectML); elsewhere everything runs on the CPU.
+    /// Sessions already built for the other device are dropped as they're
+    /// next picked up, so a change takes effect on the next image.
+    pub fn set_use_gpu(&self, use_gpu: bool) {
+        self.use_gpu.store(use_gpu, Ordering::SeqCst);
+    }
+
+    fn wants_gpu(&self) -> bool {
+        cfg!(windows) && self.use_gpu.load(Ordering::SeqCst)
+    }
+
+    /// A free session for `key` built with `threads` intra-op threads, or a
+    /// newly built one if there's none. Built outside the lock so other
+    /// workers aren't held up while a model loads.
+    fn take(
+        &self,
+        key: &str,
+        model_path: &Path,
+        threads: usize,
+        gpu: bool,
+    ) -> Result<PooledSession, String> {
+        {
+            let mut pool = self
+                .pool
+                .lock()
+                .map_err(|_| "inference session lock was poisoned".to_string())?;
+            if let Some(free) = pool.get_mut(key) {
+                // Sessions built for another parallelism level are dropped
+                // here, freeing their memory.
+                while let Some(candidate) = free.pop() {
+                    if candidate.threads == threads && candidate.gpu == gpu {
+                        return Ok(candidate);
+                    }
+                }
+            }
+        }
+        Ok(PooledSession { gpu, threads, session: build_session(model_path, threads, gpu)? })
+    }
+
+    /// Returns a session to the pool, keeping at most `keep` free sessions
+    /// per model so memory shrinks back after a wider batch.
+    fn give_back(&self, key: &str, session: PooledSession, keep: usize) {
+        if let Ok(mut pool) = self.pool.lock() {
+            let free = pool.entry(key.to_string()).or_default();
+            if free.len() < keep.max(1) {
+                free.push(session);
+            }
+        }
+    }
+}
+
+/// Intra-op threads for each of `parallel` sessions running side by side:
+/// the machine's cores split evenly between them.
+fn threads_per_session(parallel: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores / parallel.max(1)).max(1)
 }
 
 fn ensure_ort_environment() {
@@ -45,11 +122,28 @@ fn ensure_ort_environment() {
     });
 }
 
-fn build_session(model_path: &Path) -> Result<Session, String> {
+fn build_session(model_path: &Path, threads: usize, gpu: bool) -> Result<Session, String> {
     ensure_ort_environment();
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let cpu = ep::CPU::default().with_arena_allocator(false).build();
+    // DirectML first, CPU as the fallback for any operator it can't run. If
+    // DirectML can't be registered at all (no DX12 GPU, driver trouble) ORT
+    // skips it and the session simply runs on the CPU.
+    #[cfg(windows)]
+    let providers = if gpu {
+        vec![
+            ep::DirectML::default()
+                .with_performance_preference(ep::directml::PerformancePreference::HighPerformance)
+                .build(),
+            cpu,
+        ]
+    } else {
+        vec![cpu]
+    };
+    #[cfg(not(windows))]
+    let providers = {
+        let _ = gpu;
+        vec![cpu]
+    };
 
     // The CPU arena allocator and the memory-pattern planner both reserve
     // large contiguous blocks up front and never hand them back. For the
@@ -60,7 +154,7 @@ fn build_session(model_path: &Path) -> Result<Session, String> {
     // peak usage is the real working set instead of an over-sized arena.
     Session::builder()
         .map_err(|e| format!("failed to initialize the inference session: {e}"))?
-        .with_execution_providers([ep::CPU::default().with_arena_allocator(false).build()])
+        .with_execution_providers(providers)
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
         .with_memory_pattern(false)
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
@@ -81,31 +175,49 @@ pub fn remove_background(
     model_path: &Path,
     original: &image::DynamicImage,
 ) -> Result<RgbaImage, String> {
+    remove_background_parallel(state, spec, model_path, original, 1)
+}
+
+/// [`remove_background`] for a caller running `parallel` of these at once
+/// (a batch): each call then uses its share of the CPU cores, and up to
+/// `parallel` sessions of the model are kept ready between calls.
+pub fn remove_background_parallel(
+    state: &InferenceState,
+    spec: &ModelSpec,
+    model_path: &Path,
+    original: &image::DynamicImage,
+    parallel: usize,
+) -> Result<RgbaImage, String> {
     let (orig_w, orig_h) = (original.width(), original.height());
     if orig_w == 0 || orig_h == 0 {
         return Err("image has zero width or height".to_string());
     }
 
+    let threads = threads_per_session(parallel);
+    let gpu = state.wants_gpu();
     let mask_native = {
-        let mut sessions = state
-            .0
-            .lock()
-            .map_err(|_| "inference session lock was poisoned".to_string())?;
-        if !sessions.contains_key(spec.key) {
-            sessions.insert(spec.key.to_string(), build_session(model_path)?);
-        }
-        let session = sessions
-            .get_mut(spec.key)
-            .expect("session was just inserted");
-        match run_inference(session, spec, original) {
-            Ok(mask) => mask,
-            Err(e) => {
-                // Drop the session so whatever memory it was holding is
-                // released and the next image starts from a clean slate
-                // instead of failing the same way again.
-                sessions.remove(spec.key);
-                return Err(friendly_inference_error(e));
+        let mut pooled = state.take(spec.key, model_path, threads, gpu)?;
+        match run_inference(&mut pooled.session, spec, original) {
+            Ok(mask) => {
+                state.give_back(spec.key, pooled, parallel);
+                mask
             }
+            // A failed session isn't handed back, so whatever memory it was
+            // holding is released and the next image starts from a clean
+            // slate instead of failing the same way again. A GPU failure
+            // (most likely out of video memory) gets one more try on the
+            // CPU, so the image still gets done.
+            Err(e) if gpu => {
+                drop(pooled);
+                let mut cpu = state
+                    .take(spec.key, model_path, threads, false)
+                    .map_err(|cpu_err| format!("GPU: {e}; CPU: {cpu_err}"))?;
+                let mask = run_inference(&mut cpu.session, spec, original)
+                    .map_err(|cpu_err| friendly_inference_error(format!("GPU: {e}; CPU: {cpu_err}")))?;
+                drop(cpu);
+                mask
+            }
+            Err(e) => return Err(friendly_inference_error(e)),
         }
     };
 
