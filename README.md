@@ -36,6 +36,9 @@ internet access required after a one-time setup step.
   window. Batches can apply one background color and drop shadow to every
   image, name outputs from a template (`{name}`, `{index}`), be cancelled
   mid-run, retry just the files that failed, and be exported as a ZIP.
+  With "Include subfolders" (on by default), a folder's subfolders are
+  searched too, and outputs are written to the same subfolders under the
+  chosen output folder (`input\sub\a.jpg` → `output\sub\a-nobg.png`).
 - **Refine by hand.** Brush over the result to erase or restore parts of the
   cutout, with undo/redo — for the spots the model gets almost right.
 - **Refine the edge.** Shift (shrink/grow), smooth, or feather the cutout's

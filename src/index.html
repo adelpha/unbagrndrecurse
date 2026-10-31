@@ -114,6 +114,17 @@
                 </label>
               </div>
 
+              <label class="bg-shadow-toggle">
+                <input type="checkbox" id="batch-recursive" checked />
+                Include subfolders
+              </label>
+              <p class="bg-editor-hint">
+                For a folder, also process the images in every folder inside it.
+                With a "Save to" folder chosen, each result goes into the same
+                subfolder there (<code>input\sub\a.jpg</code> &rarr;
+                <code>output\sub\a-nobg.png</code>).
+              </p>
+
               <label class="batch-name-field">
                 <span class="swatch-group-label">File name</span>
                 <input type="text" id="batch-name-template" placeholder="{name}-nobg" spellcheck="false" autocomplete="off" />

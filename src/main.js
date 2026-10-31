@@ -136,6 +136,7 @@ const batchNameTemplateInput = $("batch-name-template");
 const batchDropzone = $("batch-dropzone");
 const batchPickFilesBtn = $("batch-pick-files-btn");
 const batchPickFolderBtn = $("batch-pick-folder-btn");
+const batchRecursiveInput = $("batch-recursive");
 const batchResult = $("batch-result");
 const batchProgressFill = $("batch-progress-fill");
 const batchProgressLabel = $("batch-progress-label");
@@ -1753,7 +1754,9 @@ function showEntryDone(entry, outputPath, afterDataUrl) {
   entry.status = "done";
   entry.outputPath = outputPath;
   entry.message = null;
-  lastBatchOutputDir = parentDir(outputPath);
+  // With a chosen output folder, "Show" opens its top, not whichever
+  // mirrored subfolder the last file happened to land in.
+  lastBatchOutputDir = batch?.outputDir ?? parentDir(outputPath);
   thumbEl.dataset.settled = "1";
   statusEl.textContent = "Done";
   statusEl.className = "file-status done";
@@ -1834,6 +1837,7 @@ async function runBatch(indices) {
       positions: indices,
       total: entries.length,
       reservedOutputs: entries.filter((e) => e.status === "done").map((e) => e.outputPath),
+      subdirs: indices.map((i) => entries[i].subdir),
       outputDir: runOutputDir,
       modelKey: selectedModelKey,
       exportFormat,
@@ -1867,12 +1871,22 @@ async function processBatch(paths) {
 
   try {
     setStatus("Preparing…");
-    const expandedPaths = await invoke("expand_batch_paths", { paths });
-    const entries = expandedPaths.map((path) => {
-      const name = path.split(/[/\\]/).pop() ?? path;
+    const inputs = await invoke("expand_batch_paths", {
+      paths,
+      recursive: batchRecursiveInput.checked,
+      // Never pick up a previous run's results when the output folder sits
+      // inside the folder being processed.
+      skipDir: outputDir,
+    });
+    const entries = inputs.map(({ path, subdir }) => {
+      const sep = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+      const base = path.split(/[/\\]/).pop() ?? path;
+      // Show where a file sits inside the folder, so same-named files from
+      // different subfolders can be told apart.
+      const name = subdir ? `${subdir}${sep}${base}` : base;
       const row = renderBatchRow(name);
       showBeforeThumb(row.thumbEl, path);
-      return { path, name, row, status: "pending", outputPath: null, message: null };
+      return { path, subdir, name, row, status: "pending", outputPath: null, message: null };
     });
     batch = { entries, options: readBatchOptions(), outputDir };
     batchProgressLabel.textContent = `0 / ${entries.length}`;
