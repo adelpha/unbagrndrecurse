@@ -28,6 +28,17 @@ pub struct InferenceState {
     pool: Mutex<HashMap<String, Vec<PooledSession>>>,
     /// Run on the GPU (DirectML, Windows only) when possible.
     use_gpu: AtomicBool,
+    /// Set once the GPU has failed (out of video memory, "device removed"
+    /// after a driver reset...). Everything then runs on the CPU until the
+    /// next [`InferenceState::set_use_gpu`] call, instead of every image
+    /// failing on the GPU first.
+    gpu_failed: AtomicBool,
+    /// Held for the whole of a GPU inference. A big model can fill a whole
+    /// card on its own (BiRefNet at 1024px takes ~6.5 GB on DirectML), and
+    /// two at once overflow it into system RAM or crash the GPU driver, so
+    /// GPU work is one image at a time. Parallel batch workers still
+    /// overlap decoding and saving with it.
+    gpu_gate: Mutex<()>,
 }
 
 struct PooledSession {
@@ -48,19 +59,88 @@ impl Default for InferenceState {
 
 impl InferenceState {
     pub fn new() -> Self {
-        Self { pool: Mutex::new(HashMap::new()), use_gpu: AtomicBool::new(true) }
+        Self {
+            pool: Mutex::new(HashMap::new()),
+            use_gpu: AtomicBool::new(true),
+            gpu_failed: AtomicBool::new(false),
+            gpu_gate: Mutex::new(()),
+        }
     }
 
     /// Whether new inference sessions should run on the GPU. Only has an
     /// effect on Windows (DirectML); elsewhere everything runs on the CPU.
     /// Sessions already built for the other device are dropped as they're
     /// next picked up, so a change takes effect on the next image.
+    /// Also clears an earlier GPU failure, so each new run tries the GPU
+    /// again.
     pub fn set_use_gpu(&self, use_gpu: bool) {
         self.use_gpu.store(use_gpu, Ordering::SeqCst);
+        self.gpu_failed.store(false, Ordering::SeqCst);
     }
 
     fn wants_gpu(&self) -> bool {
-        cfg!(windows) && self.use_gpu.load(Ordering::SeqCst)
+        cfg!(windows)
+            && self.use_gpu.load(Ordering::SeqCst)
+            && !self.gpu_failed.load(Ordering::SeqCst)
+    }
+
+    /// Gives up on the GPU for this run and frees every GPU session (after
+    /// a device reset they're unusable anyway).
+    fn mark_gpu_failed(&self) {
+        self.gpu_failed.store(true, Ordering::SeqCst);
+        if let Ok(mut pool) = self.pool.lock() {
+            for free in pool.values_mut() {
+                free.retain(|s| !s.gpu);
+            }
+        }
+    }
+
+    /// Runs `spec` on `original` with a pooled session: on the GPU (one at
+    /// a time) when enabled and working, otherwise on the CPU. A GPU
+    /// failure, whether loading the model or running it, switches to the
+    /// CPU for this image and the rest of the run.
+    fn infer(
+        &self,
+        spec: &ModelSpec,
+        model_path: &Path,
+        original: &image::DynamicImage,
+        parallel: usize,
+    ) -> Result<ImageBuffer<Luma<u8>, Vec<u8>>, String> {
+        let threads = threads_per_session(parallel);
+        let mut gpu_error = None;
+        if self.wants_gpu() {
+            let _gate = self.gpu_gate.lock().unwrap_or_else(|p| p.into_inner());
+            let outcome = self
+                .take(spec.key, model_path, threads, true)
+                .and_then(|mut pooled| {
+                    let mask = run_inference(&mut pooled.session, spec, original)?;
+                    self.give_back(spec.key, pooled, 1);
+                    Ok(mask)
+                });
+            match outcome {
+                Ok(mask) => return Ok(mask),
+                Err(e) => {
+                    eprintln!("unbagrnd: GPU inference failed, using the CPU from now on: {e}");
+                    self.mark_gpu_failed();
+                    gpu_error = Some(e);
+                }
+            }
+        }
+
+        let mut pooled = self.take(spec.key, model_path, threads, false)?;
+        match run_inference(&mut pooled.session, spec, original) {
+            Ok(mask) => {
+                self.give_back(spec.key, pooled, parallel);
+                Ok(mask)
+            }
+            // A failed session isn't handed back, so whatever memory it was
+            // holding is released and the next image starts from a clean
+            // slate instead of failing the same way again.
+            Err(e) => Err(friendly_inference_error(match gpu_error {
+                Some(gpu) => format!("GPU: {gpu}; CPU: {e}"),
+                None => e,
+            })),
+        }
     }
 
     /// A free session for `key` built with `threads` intra-op threads, or a
@@ -193,33 +273,7 @@ pub fn remove_background_parallel(
         return Err("image has zero width or height".to_string());
     }
 
-    let threads = threads_per_session(parallel);
-    let gpu = state.wants_gpu();
-    let mask_native = {
-        let mut pooled = state.take(spec.key, model_path, threads, gpu)?;
-        match run_inference(&mut pooled.session, spec, original) {
-            Ok(mask) => {
-                state.give_back(spec.key, pooled, parallel);
-                mask
-            }
-            // A failed session isn't handed back, so whatever memory it was
-            // holding is released and the next image starts from a clean
-            // slate instead of failing the same way again. A GPU failure
-            // (most likely out of video memory) gets one more try on the
-            // CPU, so the image still gets done.
-            Err(e) if gpu => {
-                drop(pooled);
-                let mut cpu = state
-                    .take(spec.key, model_path, threads, false)
-                    .map_err(|cpu_err| format!("GPU: {e}; CPU: {cpu_err}"))?;
-                let mask = run_inference(&mut cpu.session, spec, original)
-                    .map_err(|cpu_err| friendly_inference_error(format!("GPU: {e}; CPU: {cpu_err}")))?;
-                drop(cpu);
-                mask
-            }
-            Err(e) => return Err(friendly_inference_error(e)),
-        }
-    };
+    let mask_native = state.infer(spec, model_path, original, parallel)?;
 
     let mask_full = image::imageops::resize(&mask_native, orig_w, orig_h, FilterType::Lanczos3);
 
