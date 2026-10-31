@@ -413,14 +413,15 @@
             </label>
             <label class="settings-row">
               <span>Use the CPU too while the GPU is busy</span>
-              <input type="checkbox" id="cpu-alongside-toggle" checked />
+              <input type="checkbox" id="cpu-alongside-toggle" />
             </label>
             <p class="settings-hint">
               Runs the model on your graphics card (DirectML, Windows), which is
               usually much faster. If the GPU can't run it (say, out of video
               memory) that image is done on the CPU instead. With "Images at
               once" above 1 in a batch, the CPU can work on other images at the
-              same time as the GPU: faster, but uses about 5 GB more RAM.
+              same time as the GPU. That can end up slower, because the CPU work also
+              slows the GPU down, and it uses about 5 GB more RAM, so it's off by default.
             </p>
           </section>
 

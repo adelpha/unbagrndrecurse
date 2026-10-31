@@ -2212,7 +2212,7 @@ async function init() {
     exportFormat = settings.exportFormat;
     exportFormatSelect.value = settings.exportFormat;
     useGpuToggle.checked = settings.useGpu ?? true;
-    cpuAlongsideToggle.checked = settings.cpuAlongsideGpu ?? true;
+    cpuAlongsideToggle.checked = settings.cpuAlongsideGpu ?? false;
     refreshDeviceToggles();
     populateModelSelect();
     renderModelBar();

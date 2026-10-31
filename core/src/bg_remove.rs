@@ -67,7 +67,7 @@ impl InferenceState {
             use_gpu: AtomicBool::new(true),
             gpu_failed: AtomicBool::new(false),
             gpu_gate: Mutex::new(()),
-            cpu_alongside_gpu: AtomicBool::new(true),
+            cpu_alongside_gpu: AtomicBool::new(false),
         }
     }
 

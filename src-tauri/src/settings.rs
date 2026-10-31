@@ -28,7 +28,10 @@ pub struct Settings {
     pub use_gpu: bool,
     /// With more than one image at a time, run images on the CPU while the
     /// GPU is busy with another, instead of queueing for the GPU.
-    #[serde(default = "default_use_gpu")]
+    /// Off by default: measured slower than the GPU alone on an
+    /// RTX 3070 Ti + i7-6850K (16.9 vs 20.0 images/min), because the CPU
+    /// work starved the GPU path of CPU time.
+    #[serde(default)]
     pub cpu_alongside_gpu: bool,
 }
 
@@ -47,7 +50,7 @@ impl Default for Settings {
             theme: "system".to_string(),
             export_format: default_export_format(),
             use_gpu: default_use_gpu(),
-            cpu_alongside_gpu: default_use_gpu(),
+            cpu_alongside_gpu: false,
         }
     }
 }
