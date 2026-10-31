@@ -39,6 +39,9 @@ pub struct InferenceState {
     /// GPU work is one image at a time. Parallel batch workers still
     /// overlap decoding and saving with it.
     gpu_gate: Mutex<()>,
+    /// While the GPU is busy, run other images on the CPU instead of
+    /// waiting for it (only matters with more than one image at a time).
+    cpu_alongside_gpu: AtomicBool,
 }
 
 struct PooledSession {
@@ -64,6 +67,7 @@ impl InferenceState {
             use_gpu: AtomicBool::new(true),
             gpu_failed: AtomicBool::new(false),
             gpu_gate: Mutex::new(()),
+            cpu_alongside_gpu: AtomicBool::new(true),
         }
     }
 
@@ -76,6 +80,11 @@ impl InferenceState {
     pub fn set_use_gpu(&self, use_gpu: bool) {
         self.use_gpu.store(use_gpu, Ordering::SeqCst);
         self.gpu_failed.store(false, Ordering::SeqCst);
+    }
+
+    /// See [`InferenceState::cpu_alongside_gpu`].
+    pub fn set_cpu_alongside_gpu(&self, on: bool) {
+        self.cpu_alongside_gpu.store(on, Ordering::SeqCst);
     }
 
     fn wants_gpu(&self) -> bool {
@@ -106,23 +115,45 @@ impl InferenceState {
         original: &image::DynamicImage,
         parallel: usize,
     ) -> Result<ImageBuffer<Luma<u8>, Vec<u8>>, String> {
-        let threads = threads_per_session(parallel);
+        let mut threads = threads_per_session(parallel);
+        let mut keep_cpu = parallel;
         let mut gpu_error = None;
         if self.wants_gpu() {
-            let _gate = self.gpu_gate.lock().unwrap_or_else(|p| p.into_inner());
-            let outcome = self
-                .take(spec.key, model_path, threads, true)
-                .and_then(|mut pooled| {
-                    let mask = run_inference(&mut pooled.session, spec, original)?;
-                    self.give_back(spec.key, pooled, 1);
-                    Ok(mask)
-                });
-            match outcome {
-                Ok(mask) => return Ok(mask),
-                Err(e) => {
-                    eprintln!("unbagrnd: GPU inference failed, using the CPU from now on: {e}");
-                    self.mark_gpu_failed();
-                    gpu_error = Some(e);
+            let sharing = parallel > 1 && self.cpu_alongside_gpu.load(Ordering::SeqCst);
+            let gate = if sharing {
+                // GPU busy with another image: do this one on the CPU
+                // rather than queue for the GPU. The other workers split
+                // the cores, leaving one free to keep the GPU fed.
+                match self.gpu_gate.try_lock() {
+                    Ok(gate) => Some(gate),
+                    Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                }
+            } else {
+                Some(self.gpu_gate.lock().unwrap_or_else(|p| p.into_inner()))
+            };
+            if sharing {
+                threads = (cpu_cores().saturating_sub(1) / (parallel - 1)).max(1);
+                keep_cpu = parallel - 1;
+            }
+            if let Some(_gate) = gate {
+                let outcome =
+                    self.take(spec.key, model_path, threads, true)
+                        .and_then(|mut pooled| {
+                            let mask = run_inference(&mut pooled.session, spec, original)?;
+                            self.give_back(spec.key, pooled, 1);
+                            Ok(mask)
+                        });
+                match outcome {
+                    Ok(mask) => return Ok(mask),
+                    Err(e) => {
+                        eprintln!("unbagrnd: GPU inference failed, using the CPU from now on: {e}");
+                        self.mark_gpu_failed();
+                        gpu_error = Some(e);
+                        // Back to the normal CPU split for the rest of the run.
+                        threads = threads_per_session(parallel);
+                        keep_cpu = parallel;
+                    }
                 }
             }
         }
@@ -130,7 +161,7 @@ impl InferenceState {
         let mut pooled = self.take(spec.key, model_path, threads, false)?;
         match run_inference(&mut pooled.session, spec, original) {
             Ok(mask) => {
-                self.give_back(spec.key, pooled, parallel);
+                self.give_back(spec.key, pooled, keep_cpu);
                 Ok(mask)
             }
             // A failed session isn't handed back, so whatever memory it was
@@ -168,7 +199,11 @@ impl InferenceState {
                 }
             }
         }
-        Ok(PooledSession { gpu, threads, session: build_session(model_path, threads, gpu)? })
+        Ok(PooledSession {
+            gpu,
+            threads,
+            session: build_session(model_path, threads, gpu)?,
+        })
     }
 
     /// Returns a session to the pool, keeping at most `keep` free sessions
@@ -186,10 +221,13 @@ impl InferenceState {
 /// Intra-op threads for each of `parallel` sessions running side by side:
 /// the machine's cores split evenly between them.
 fn threads_per_session(parallel: usize) -> usize {
-    let cores = std::thread::available_parallelism()
+    (cpu_cores() / parallel.max(1)).max(1)
+}
+
+fn cpu_cores() -> usize {
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4);
-    (cores / parallel.max(1)).max(1)
+        .unwrap_or(4)
 }
 
 fn ensure_ort_environment() {

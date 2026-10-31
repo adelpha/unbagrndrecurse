@@ -26,6 +26,10 @@ pub struct Settings {
     /// ignored elsewhere. Falls back to the CPU on its own if the GPU fails.
     #[serde(default = "default_use_gpu")]
     pub use_gpu: bool,
+    /// With more than one image at a time, run images on the CPU while the
+    /// GPU is busy with another, instead of queueing for the GPU.
+    #[serde(default = "default_use_gpu")]
+    pub cpu_alongside_gpu: bool,
 }
 
 fn default_use_gpu() -> bool {
@@ -43,6 +47,7 @@ impl Default for Settings {
             theme: "system".to_string(),
             export_format: default_export_format(),
             use_gpu: default_use_gpu(),
+            cpu_alongside_gpu: default_use_gpu(),
         }
     }
 }
@@ -114,9 +119,16 @@ pub async fn set_theme(app: &AppHandle, theme: &str) -> Result<Settings, String>
     Ok(settings)
 }
 
-pub async fn set_use_gpu(app: &AppHandle, use_gpu: bool) -> Result<Settings, String> {
+pub async fn set_use_gpu(
+    app: &AppHandle,
+    use_gpu: bool,
+    cpu_alongside_gpu: Option<bool>,
+) -> Result<Settings, String> {
     let mut settings = load_settings(app)?;
     settings.use_gpu = use_gpu;
+    if let Some(on) = cpu_alongside_gpu {
+        settings.cpu_alongside_gpu = on;
+    }
     save(app, &settings).await?;
     Ok(settings)
 }

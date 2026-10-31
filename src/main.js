@@ -50,6 +50,7 @@ const settingsCloseBtn = $("settings-close-btn");
 const themeSelect = $("theme-select");
 const exportFormatSelect = $("export-format-select");
 const useGpuToggle = $("use-gpu-toggle");
+const cpuAlongsideToggle = $("cpu-alongside-toggle");
 const settingsModelList = $("settings-model-list");
 const clearAllModelsBtn = $("clear-all-models-btn");
 
@@ -640,14 +641,25 @@ exportFormatSelect.addEventListener("change", async () => {
 // DirectML is Windows-only; there's nothing to switch elsewhere.
 if (!/Windows/i.test(navigator.userAgent)) $("settings-performance").hidden = true;
 
-useGpuToggle.addEventListener("change", async () => {
-  try {
-    await invoke("set_use_gpu", { useGpu: useGpuToggle.checked });
-  } catch (err) {
-    useGpuToggle.checked = !useGpuToggle.checked;
-    setStatus(`Failed: ${err}`);
-  }
-});
+function refreshDeviceToggles() {
+  cpuAlongsideToggle.disabled = !useGpuToggle.checked;
+}
+
+for (const toggle of [useGpuToggle, cpuAlongsideToggle]) {
+  toggle.addEventListener("change", async () => {
+    refreshDeviceToggles();
+    try {
+      await invoke("set_use_gpu", {
+        useGpu: useGpuToggle.checked,
+        cpuAlongsideGpu: cpuAlongsideToggle.checked,
+      });
+    } catch (err) {
+      toggle.checked = !toggle.checked;
+      refreshDeviceToggles();
+      setStatus(`Failed: ${err}`);
+    }
+  });
+}
 
 // ---------------------------------------------------------------------
 // Tabs
@@ -2200,6 +2212,8 @@ async function init() {
     exportFormat = settings.exportFormat;
     exportFormatSelect.value = settings.exportFormat;
     useGpuToggle.checked = settings.useGpu ?? true;
+    cpuAlongsideToggle.checked = settings.cpuAlongsideGpu ?? true;
+    refreshDeviceToggles();
     populateModelSelect();
     renderModelBar();
     setStatus("Ready.");

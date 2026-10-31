@@ -222,16 +222,24 @@ pub async fn set_theme(app: AppHandle, theme: String) -> Result<Settings, String
 }
 
 #[tauri::command]
-pub async fn set_use_gpu(app: AppHandle, use_gpu: bool) -> Result<Settings, String> {
-    let settings = settings::set_use_gpu(&app, use_gpu).await?;
-    app.state::<InferenceState>().set_use_gpu(settings.use_gpu);
+pub async fn set_use_gpu(
+    app: AppHandle,
+    use_gpu: bool,
+    cpu_alongside_gpu: Option<bool>,
+) -> Result<Settings, String> {
+    let settings = settings::set_use_gpu(&app, use_gpu, cpu_alongside_gpu).await?;
+    let inference = app.state::<InferenceState>();
+    inference.set_use_gpu(settings.use_gpu);
+    inference.set_cpu_alongside_gpu(settings.cpu_alongside_gpu);
     Ok(settings)
 }
 
 /// Points the inference pool at the device chosen in Settings, before a run.
 fn apply_device_setting(app: &AppHandle) -> Result<(), String> {
-    let use_gpu = settings::load_settings(app)?.use_gpu;
-    app.state::<InferenceState>().set_use_gpu(use_gpu);
+    let settings = settings::load_settings(app)?;
+    let inference = app.state::<InferenceState>();
+    inference.set_use_gpu(settings.use_gpu);
+    inference.set_cpu_alongside_gpu(settings.cpu_alongside_gpu);
     Ok(())
 }
 
