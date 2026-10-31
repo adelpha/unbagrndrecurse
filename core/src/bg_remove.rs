@@ -238,7 +238,16 @@ fn build_session(model_path: &Path, threads: usize, gpu: bool) -> Result<Session
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
         .with_memory_pattern(false)
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        // On DirectML, ORT's graph optimisations (Level1 as well as Level3)
+        // made BiRefNet fill an 8 GB card, spill ~16 GB into system RAM and
+        // reset the GPU driver (887A0005) on the second image. With them
+        // off it stayed stable, used less RAM and ran ~3x faster than the
+        // CPU. The CPU path keeps full optimisation.
+        .with_optimization_level(if gpu {
+            GraphOptimizationLevel::Disable
+        } else {
+            GraphOptimizationLevel::Level3
+        })
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
         .with_intra_threads(threads)
         .map_err(|e| format!("failed to configure the inference session: {e}"))?
