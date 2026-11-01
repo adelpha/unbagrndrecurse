@@ -114,6 +114,34 @@
                 </label>
               </div>
 
+              <label class="bg-shadow-toggle">
+                <input type="checkbox" id="batch-recursive" checked />
+                Include subfolders
+              </label>
+              <p class="bg-editor-hint">
+                For a folder, also process the images in every folder inside it.
+                With a "Save to" folder chosen, each result goes into the same
+                subfolder there (<code>input\sub\a.jpg</code> &rarr;
+                <code>output\sub\a-nobg.png</code>).
+              </p>
+
+              <label class="batch-name-field">
+                <span class="swatch-group-label">Images at once</span>
+                <select id="batch-parallel">
+                  <option value="1" selected>1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="6">6</option>
+                  <option value="8">8</option>
+                </select>
+              </label>
+              <p class="bg-editor-hint">
+                Processes several images side by side. Each one keeps its own copy
+                of the model in memory: on the GPU, BiRefNet alone can take 6 GB+,
+                so leave this at 1 there unless you have video memory to spare.
+              </p>
+
               <label class="batch-name-field">
                 <span class="swatch-group-label">File name</span>
                 <input type="text" id="batch-name-template" placeholder="{name}-nobg" spellcheck="false" autocomplete="off" />
@@ -374,6 +402,26 @@
             <p class="settings-hint">
               WebP is a smaller lossless file with the same transparency as
               PNG. SVG wraps the result as a scalable, vector-embedded image.
+            </p>
+          </section>
+
+          <section class="settings-section" id="settings-performance">
+            <h3>Performance</h3>
+            <label class="settings-row">
+              <span>Use the GPU</span>
+              <input type="checkbox" id="use-gpu-toggle" checked />
+            </label>
+            <label class="settings-row">
+              <span>Use the CPU too while the GPU is busy</span>
+              <input type="checkbox" id="cpu-alongside-toggle" />
+            </label>
+            <p class="settings-hint">
+              Runs the model on your graphics card (DirectML, Windows), which is
+              usually much faster. If the GPU can't run it (say, out of video
+              memory) that image is done on the CPU instead. With "Images at
+              once" above 1 in a batch, the CPU can work on other images at the
+              same time as the GPU. That can end up slower, because the CPU work also
+              slows the GPU down, and it uses about 5 GB more RAM, so it's off by default.
             </p>
           </section>
 

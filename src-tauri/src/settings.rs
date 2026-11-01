@@ -22,6 +22,21 @@ pub struct Settings {
     /// output is saved in (see [`crate::commands::write_output`]).
     #[serde(default = "default_export_format")]
     pub export_format: String,
+    /// Run the model on the GPU (DirectML) where available - Windows only;
+    /// ignored elsewhere. Falls back to the CPU on its own if the GPU fails.
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
+    /// With more than one image at a time, run images on the CPU while the
+    /// GPU is busy with another, instead of queueing for the GPU.
+    /// Off by default: measured slower than the GPU alone on an
+    /// RTX 3070 Ti + i7-6850K (16.9 vs 20.0 images/min), because the CPU
+    /// work starved the GPU path of CPU time.
+    #[serde(default)]
+    pub cpu_alongside_gpu: bool,
+}
+
+fn default_use_gpu() -> bool {
+    true
 }
 
 fn default_export_format() -> String {
@@ -34,6 +49,8 @@ impl Default for Settings {
             selected_model: DEFAULT_MODEL_KEY.to_string(),
             theme: "system".to_string(),
             export_format: default_export_format(),
+            use_gpu: default_use_gpu(),
+            cpu_alongside_gpu: false,
         }
     }
 }
@@ -101,6 +118,20 @@ pub async fn set_theme(app: &AppHandle, theme: &str) -> Result<Settings, String>
     }
     let mut settings = load_settings(app)?;
     settings.theme = theme.to_string();
+    save(app, &settings).await?;
+    Ok(settings)
+}
+
+pub async fn set_use_gpu(
+    app: &AppHandle,
+    use_gpu: bool,
+    cpu_alongside_gpu: Option<bool>,
+) -> Result<Settings, String> {
+    let mut settings = load_settings(app)?;
+    settings.use_gpu = use_gpu;
+    if let Some(on) = cpu_alongside_gpu {
+        settings.cpu_alongside_gpu = on;
+    }
     save(app, &settings).await?;
     Ok(settings)
 }

@@ -34,6 +34,7 @@ pub fn run() {
             commands::set_selected_model,
             commands::set_theme,
             commands::set_export_format,
+            commands::set_use_gpu,
             commands::download_model,
             commands::clear_model,
             commands::clear_all_models,

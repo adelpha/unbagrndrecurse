@@ -49,6 +49,8 @@ const settingsOverlay = $("settings-overlay");
 const settingsCloseBtn = $("settings-close-btn");
 const themeSelect = $("theme-select");
 const exportFormatSelect = $("export-format-select");
+const useGpuToggle = $("use-gpu-toggle");
+const cpuAlongsideToggle = $("cpu-alongside-toggle");
 const settingsModelList = $("settings-model-list");
 const clearAllModelsBtn = $("clear-all-models-btn");
 
@@ -136,6 +138,8 @@ const batchNameTemplateInput = $("batch-name-template");
 const batchDropzone = $("batch-dropzone");
 const batchPickFilesBtn = $("batch-pick-files-btn");
 const batchPickFolderBtn = $("batch-pick-folder-btn");
+const batchRecursiveInput = $("batch-recursive");
+const batchParallelSelect = $("batch-parallel");
 const batchResult = $("batch-result");
 const batchProgressFill = $("batch-progress-fill");
 const batchProgressLabel = $("batch-progress-label");
@@ -633,6 +637,29 @@ exportFormatSelect.addEventListener("change", async () => {
     setStatus(`Failed: ${err}`);
   }
 });
+
+// DirectML is Windows-only; there's nothing to switch elsewhere.
+if (!/Windows/i.test(navigator.userAgent)) $("settings-performance").hidden = true;
+
+function refreshDeviceToggles() {
+  cpuAlongsideToggle.disabled = !useGpuToggle.checked;
+}
+
+for (const toggle of [useGpuToggle, cpuAlongsideToggle]) {
+  toggle.addEventListener("change", async () => {
+    refreshDeviceToggles();
+    try {
+      await invoke("set_use_gpu", {
+        useGpu: useGpuToggle.checked,
+        cpuAlongsideGpu: cpuAlongsideToggle.checked,
+      });
+    } catch (err) {
+      toggle.checked = !toggle.checked;
+      refreshDeviceToggles();
+      setStatus(`Failed: ${err}`);
+    }
+  });
+}
 
 // ---------------------------------------------------------------------
 // Tabs
@@ -1578,6 +1605,7 @@ batchPickFolderBtn.addEventListener("click", async () => {
 
 batchResetBtn.addEventListener("click", () => {
   batch = null;
+  stopObservingBatchRows();
   batchResult.hidden = true;
   setBatchSetupVisible(true);
   batchFileList.innerHTML = "";
@@ -1668,6 +1696,7 @@ function readBatchOptions() {
         }
       : null,
     nameTemplate: batchNameTemplateInput.value.trim() || null,
+    parallel: Number(batchParallelSelect.value) || 1,
   };
 }
 
@@ -1680,7 +1709,6 @@ function renderBatchRow(fileName) {
   li.title = fileName;
   const thumbEl = document.createElement("div");
   thumbEl.className = "file-thumb";
-  thumbEl.innerHTML = '<span class="file-thumb-spinner"></span>';
   const nameEl = document.createElement("span");
   nameEl.className = "file-name";
   nameEl.textContent = fileName;
@@ -1689,26 +1717,122 @@ function renderBatchRow(fileName) {
   statusEl.textContent = "Waiting…";
   li.append(thumbEl, nameEl, statusEl);
   batchFileList.appendChild(li);
-  return { thumbEl, statusEl };
+  return { li, thumbEl, statusEl };
+}
+
+// ---- Batch thumbnails (lazy) ----
+//
+// A batch can hold thousands of files, so thumbnails are only loaded for
+// rows on (or near) screen, and dropped again once a row scrolls away -
+// otherwise every row's picture would be decoded at once and kept in the
+// webview for good, which runs to gigabytes. The rows themselves stay, so
+// the list still scrolls through every file.
+
+/** Most `preview_image` decodes in flight at once. */
+const THUMB_CONCURRENCY = 3;
+const thumbQueue = []; // { entry, path, key }
+let thumbsInFlight = 0;
+
+const thumbObserver = new IntersectionObserver(
+  (records) => {
+    for (const record of records) {
+      const entry = record.target._entry;
+      if (!entry) continue;
+      entry.visible = record.isIntersecting;
+      if (entry.visible) paintThumb(entry);
+      else unloadThumb(entry);
+    }
+  },
+  // Start loading a little before a row scrolls into view.
+  { root: batchFileList, rootMargin: "300px 0px" },
+);
+
+function observeBatchRow(entry) {
+  entry.visible = false;
+  entry.row.li._entry = entry;
+  thumbObserver.observe(entry.row.li);
+}
+
+function stopObservingBatchRows() {
+  thumbObserver.disconnect();
+  thumbQueue.length = 0;
+}
+
+/** Empties an off-screen row's thumbnail, freeing its image. */
+function unloadThumb(entry) {
+  const { thumbEl } = entry.row;
+  delete thumbEl.dataset.key;
+  thumbEl.classList.remove("checkerboard");
+  thumbEl.innerHTML = "";
 }
 
 /**
- * Shows the original image in `thumbEl` right away (with a spinner overlaid
- * on top, since it's still just the "before" picture), so the row isn't
- * blank while the real background-removal pass — which is much slower — is
- * still running. Swapped out for the real result once that pass finishes.
+ * Draws `entry`'s thumbnail for its current state, if its row is on screen:
+ * the original image (with a spinner while still waiting) before it's
+ * processed, the result once done, or a "!" on error. `freshDataUrl` is a
+ * result thumbnail the backend just sent, used instead of decoding the
+ * output file again; it isn't kept, so it's freed once the row scrolls away.
  */
-async function showBeforeThumb(thumbEl, path) {
-  try {
-    const dataUrl = await invoke("preview_image", { path });
-    if (thumbEl.dataset.settled) return; // already got the real result while this was loading
-    thumbEl.innerHTML = '<div class="file-thumb-overlay"><span class="file-thumb-spinner"></span></div>';
-    const img = document.createElement("img");
-    img.src = dataUrl;
-    img.alt = "";
-    thumbEl.prepend(img);
-  } catch {
-    // Non-critical: the row just keeps showing a spinner until the real result arrives.
+function paintThumb(entry, freshDataUrl = null) {
+  if (!entry.visible) return;
+  const { thumbEl } = entry.row;
+  const path = entry.status === "done" ? entry.outputPath : entry.status === "error" ? null : entry.path;
+  const key = `${entry.status}|${path}`;
+  if (thumbEl.dataset.key === key && !freshDataUrl) return;
+  thumbEl.dataset.key = key;
+  thumbEl.classList.toggle("checkerboard", entry.status === "done");
+
+  if (entry.status === "error") {
+    thumbEl.innerHTML = '<span class="file-thumb-error">!</span>';
+    return;
+  }
+  thumbEl.innerHTML = entry.status === "pending" ? '<span class="file-thumb-spinner"></span>' : "";
+  if (freshDataUrl) {
+    setThumbImage(entry, freshDataUrl);
+  } else if (path) {
+    thumbQueue.push({ entry, path, key });
+    pumpThumbQueue();
+  }
+}
+
+function setThumbImage(entry, dataUrl) {
+  const { thumbEl } = entry.row;
+  thumbEl.innerHTML = "";
+  const img = document.createElement("img");
+  img.src = dataUrl;
+  img.alt = "";
+  img.decoding = "async";
+  thumbEl.appendChild(img);
+  // Waiting rows show the original under a spinner: it's not the result yet.
+  if (entry.status === "pending") {
+    thumbEl.insertAdjacentHTML(
+      "beforeend",
+      '<div class="file-thumb-overlay"><span class="file-thumb-spinner"></span></div>',
+    );
+  }
+}
+
+function pumpThumbQueue() {
+  while (thumbsInFlight < THUMB_CONCURRENCY && thumbQueue.length > 0) {
+    // Newest request first: after a fast scroll, what's on screen now
+    // matters more than rows that were passed on the way.
+    const job = thumbQueue.pop();
+    if (!job.entry.visible || job.entry.row.thumbEl.dataset.key !== job.key) continue;
+    thumbsInFlight += 1;
+    invoke("preview_image", { path: job.path })
+      .then((dataUrl) => {
+        if (job.entry.visible && job.entry.row.thumbEl.dataset.key === job.key) {
+          setThumbImage(job.entry, dataUrl);
+        }
+      })
+      .catch(() => {
+        // Non-critical: the row just stays without a picture (an SVG
+        // output, say, which the decoder can't read back).
+      })
+      .finally(() => {
+        thumbsInFlight -= 1;
+        pumpThumbQueue();
+      });
   }
 }
 
@@ -1749,58 +1873,54 @@ function updateBatchButtons() {
 }
 
 function showEntryDone(entry, outputPath, afterDataUrl) {
-  const { thumbEl, statusEl } = entry.row;
+  const { statusEl } = entry.row;
   entry.status = "done";
   entry.outputPath = outputPath;
   entry.message = null;
-  lastBatchOutputDir = parentDir(outputPath);
-  thumbEl.dataset.settled = "1";
+  // With a chosen output folder, "Show" opens its top, not whichever
+  // mirrored subfolder the last file happened to land in.
+  lastBatchOutputDir = batch?.outputDir ?? parentDir(outputPath);
   statusEl.textContent = "Done";
   statusEl.className = "file-status done";
   statusEl.title = "";
-  thumbEl.innerHTML = "";
-  thumbEl.classList.add("checkerboard");
-  const img = document.createElement("img");
-  img.src = afterDataUrl;
-  img.alt = "";
-  thumbEl.appendChild(img);
+  paintThumb(entry, afterDataUrl);
 }
 
 function showEntryError(entry, message) {
-  const { thumbEl, statusEl } = entry.row;
+  const { statusEl } = entry.row;
   entry.status = "error";
   entry.outputPath = null;
   entry.message = message ?? "Failed";
-  thumbEl.dataset.settled = "1";
-  thumbEl.classList.remove("checkerboard");
   statusEl.textContent = entry.message;
   statusEl.className = "file-status error";
   statusEl.title = entry.message;
-  thumbEl.innerHTML = '<span class="file-thumb-error">!</span>';
+  paintThumb(entry);
 }
 
 function showEntryCancelled(entry, text) {
-  const { thumbEl, statusEl } = entry.row;
+  const { statusEl } = entry.row;
   entry.status = "cancelled";
-  thumbEl.dataset.settled = "1";
   statusEl.textContent = text;
   statusEl.className = "file-status pending";
   // Keep the "before" picture, but stop implying it's still being worked on.
-  for (const el of thumbEl.querySelectorAll(".file-thumb-overlay, .file-thumb-spinner")) el.remove();
+  const overlay = entry.row.thumbEl.querySelector(".file-thumb-overlay");
+  if (overlay) {
+    overlay.remove();
+    entry.row.thumbEl.dataset.key = `cancelled|${entry.path}`;
+  } else {
+    paintThumb(entry);
+  }
 }
 
 /** Puts a row back to "Waiting…" with its original image, ready to be re-run. */
 function resetEntryForRetry(entry) {
-  const { thumbEl, statusEl } = entry.row;
+  const { statusEl } = entry.row;
   entry.status = "pending";
   entry.message = null;
-  delete thumbEl.dataset.settled;
-  thumbEl.classList.remove("checkerboard");
-  thumbEl.innerHTML = '<span class="file-thumb-spinner"></span>';
   statusEl.textContent = "Waiting…";
   statusEl.className = "file-status pending";
   statusEl.title = "";
-  showBeforeThumb(thumbEl, entry.path);
+  paintThumb(entry);
 }
 
 /**
@@ -1834,6 +1954,7 @@ async function runBatch(indices) {
       positions: indices,
       total: entries.length,
       reservedOutputs: entries.filter((e) => e.status === "done").map((e) => e.outputPath),
+      subdirs: indices.map((i) => entries[i].subdir),
       outputDir: runOutputDir,
       modelKey: selectedModelKey,
       exportFormat,
@@ -1855,6 +1976,7 @@ async function processBatch(paths) {
   setBusy(true);
   let completed = false;
   batch = null;
+  stopObservingBatchRows();
   batchFileList.innerHTML = "";
   batchProgressFill.style.width = "0%";
   batchProgressLabel.textContent = "";
@@ -1867,13 +1989,23 @@ async function processBatch(paths) {
 
   try {
     setStatus("Preparing…");
-    const expandedPaths = await invoke("expand_batch_paths", { paths });
-    const entries = expandedPaths.map((path) => {
-      const name = path.split(/[/\\]/).pop() ?? path;
-      const row = renderBatchRow(name);
-      showBeforeThumb(row.thumbEl, path);
-      return { path, name, row, status: "pending", outputPath: null, message: null };
+    const inputs = await invoke("expand_batch_paths", {
+      paths,
+      recursive: batchRecursiveInput.checked,
+      // Never pick up a previous run's results when the output folder sits
+      // inside the folder being processed.
+      skipDir: outputDir,
     });
+    const entries = inputs.map(({ path, subdir }) => {
+      const sep = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+      const base = path.split(/[/\\]/).pop() ?? path;
+      // Show where a file sits inside the folder, so same-named files from
+      // different subfolders can be told apart.
+      const name = subdir ? `${subdir}${sep}${base}` : base;
+      const row = renderBatchRow(name);
+      return { path, subdir, name, row, status: "pending", outputPath: null, message: null };
+    });
+    for (const entry of entries) observeBatchRow(entry);
     batch = { entries, options: readBatchOptions(), outputDir };
     batchProgressLabel.textContent = `0 / ${entries.length}`;
 
@@ -2079,6 +2211,9 @@ async function init() {
     themeSelect.value = settings.theme;
     exportFormat = settings.exportFormat;
     exportFormatSelect.value = settings.exportFormat;
+    useGpuToggle.checked = settings.useGpu ?? true;
+    cpuAlongsideToggle.checked = settings.cpuAlongsideGpu ?? false;
+    refreshDeviceToggles();
     populateModelSelect();
     renderModelBar();
     setStatus("Ready.");

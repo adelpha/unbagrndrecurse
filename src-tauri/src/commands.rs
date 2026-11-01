@@ -222,6 +222,28 @@ pub async fn set_theme(app: AppHandle, theme: String) -> Result<Settings, String
 }
 
 #[tauri::command]
+pub async fn set_use_gpu(
+    app: AppHandle,
+    use_gpu: bool,
+    cpu_alongside_gpu: Option<bool>,
+) -> Result<Settings, String> {
+    let settings = settings::set_use_gpu(&app, use_gpu, cpu_alongside_gpu).await?;
+    let inference = app.state::<InferenceState>();
+    inference.set_use_gpu(settings.use_gpu);
+    inference.set_cpu_alongside_gpu(settings.cpu_alongside_gpu);
+    Ok(settings)
+}
+
+/// Points the inference pool at the device chosen in Settings, before a run.
+fn apply_device_setting(app: &AppHandle) -> Result<(), String> {
+    let settings = settings::load_settings(app)?;
+    let inference = app.state::<InferenceState>();
+    inference.set_use_gpu(settings.use_gpu);
+    inference.set_cpu_alongside_gpu(settings.cpu_alongside_gpu);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_export_format(app: AppHandle, format: String) -> Result<Settings, String> {
     settings::set_export_format(&app, &format).await
 }
@@ -265,6 +287,7 @@ pub async fn remove_background_single(
     let spec = resolve_model(&app, model_key.as_deref())?;
     let format = resolve_export_format(&app, export_format.as_deref())?;
     let model_path = models::ensure_model(&app, spec).await?;
+    apply_device_setting(&app)?;
     let input_path_buf = PathBuf::from(&input_path);
     let output_path = output_path_for(&app, &input_path_buf, output_dir.as_deref(), "-nobg", &format)?;
 
@@ -306,13 +329,39 @@ pub async fn remove_background_single(
     .map_err(|e| format!("background task failed: {e}"))?
 }
 
+/// One image file found by [`expand_paths`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchInput {
+    pub path: String,
+    /// The folder the file sits in, relative to the dropped or picked
+    /// folder it was found under (`photos\2024` for
+    /// `<picked>\photos\2024\a.jpg`). Empty for a file at the top of
+    /// that folder or one given directly. Batch outputs are written to the
+    /// same relative folder under the chosen output folder.
+    pub subdir: String,
+}
+
 /// Expands any directories in `paths` into their individual image files
 /// (see [`expand_paths`]), without processing anything. Lets the frontend
 /// render one row per file — with its original image as an immediate
 /// preview — before background removal has even started.
+///
+/// `recursive` also searches every subfolder. `skip_dir` (normally the
+/// batch's output folder) is never searched, so re-running a batch whose
+/// output folder sits inside its input folder doesn't pick up its own
+/// earlier results.
 #[tauri::command]
-pub async fn expand_batch_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
-    expand_paths(&paths)
+pub async fn expand_batch_paths(
+    paths: Vec<String>,
+    recursive: Option<bool>,
+    skip_dir: Option<String>,
+) -> Result<Vec<BatchInput>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        expand_paths(&paths, recursive.unwrap_or(false), skip_dir.as_deref().map(Path::new))
+    })
+    .await
+    .map_err(|e| format!("background task failed: {e}"))?
 }
 
 /// Reads an image straight off disk and returns it as a small preview data
@@ -596,7 +645,14 @@ pub struct BatchOptions {
     /// batch. Empty/`None` means `{name}-nobg` (or `{name}-bg` when a
     /// background or shadow is applied).
     pub name_template: Option<String>,
+    /// How many images to process side by side (each on its share of the
+    /// CPU cores). `None` means 1, the original one-at-a-time behaviour.
+    pub parallel: Option<usize>,
 }
+
+/// Upper bound for [`BatchOptions::parallel`]: each extra worker holds its
+/// own copy of the model in memory.
+const MAX_BATCH_PARALLEL: usize = 8;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -626,6 +682,11 @@ pub fn cancel_batch(state: tauri::State<BatchCancelState>) {
 /// name token), `total` the original batch size, and `reserved_outputs` the
 /// files that run already wrote, so a retry never overwrites them. Left
 /// out, they default to a fresh batch of `input_paths`.
+///
+/// `subdirs[i]` (see [`BatchInput::subdir`]) is the relative folder under
+/// `output_dir` that `input_paths[i]`'s output goes into, created if needed,
+/// so a folder tree is mirrored into the output folder. Ignored when there
+/// is no `output_dir` (outputs then go next to each source anyway).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn remove_background_batch(
@@ -634,6 +695,7 @@ pub async fn remove_background_batch(
     positions: Option<Vec<usize>>,
     total: Option<usize>,
     reserved_outputs: Option<Vec<String>>,
+    subdirs: Option<Vec<String>>,
     output_dir: Option<String>,
     model_key: Option<String>,
     export_format: Option<String>,
@@ -656,7 +718,15 @@ pub async fn remove_background_batch(
     let spec = resolve_model(&app, model_key.as_deref())?;
     let format = resolve_export_format(&app, export_format.as_deref())?;
     let model_path = models::ensure_model(&app, spec).await?;
-    let input_paths = expand_paths(&input_paths)?;
+    apply_device_setting(&app)?;
+    let given = input_paths.len();
+    let expanded = expand_paths(&input_paths, false, None)?;
+    let subdirs: Vec<String> = match subdirs {
+        Some(subdirs) if subdirs.len() == given && expanded.len() == given => subdirs,
+        Some(_) => return Err("subdirs must have one entry per input file".to_string()),
+        None => expanded.iter().map(|input| input.subdir.clone()).collect(),
+    };
+    let input_paths: Vec<String> = expanded.into_iter().map(|input| input.path).collect();
     let positions = match positions {
         Some(positions) if positions.len() == input_paths.len() => positions,
         Some(_) => return Err("positions must have one entry per input path".to_string()),
@@ -676,7 +746,26 @@ pub async fn remove_background_batch(
     let mut processed = 0;
     let mut cancelled = false;
 
-    for (raw_input_path, position) in input_paths.into_iter().zip(positions) {
+    let parallel = options.parallel.unwrap_or(1).clamp(1, MAX_BATCH_PARALLEL);
+    // Up to `parallel` files in flight at once; output paths are still
+    // planned here, in batch order, so de-duplicated names don't depend on
+    // which file happens to finish first.
+    let mut running: tokio::task::JoinSet<(usize, String, BatchFileResult)> =
+        tokio::task::JoinSet::new();
+    let emit = |position: usize, file_name: String, result: BatchFileResult| {
+        let _ = app.emit(
+            "batch-progress",
+            BatchProgressEvent { index: position, total, file_name, result },
+        );
+    };
+
+    for ((raw_input_path, position), subdir) in input_paths.into_iter().zip(positions).zip(subdirs) {
+        while running.len() >= parallel {
+            if let Some(Ok((position, file_name, result))) = running.join_next().await {
+                processed += 1;
+                emit(position, file_name, result);
+            }
+        }
         if cancel.0.load(Ordering::SeqCst) {
             cancelled = true;
             break;
@@ -690,67 +779,77 @@ pub async fn remove_background_batch(
 
         let planned = source_stem(&input_path).and_then(|stem| {
             let out_stem = render_name_template(&template, &stem, position + 1, index_width);
-            output_path_for_stem(&app, &input_path, output_dir.as_deref(), &out_stem, &format)
+            let out_dir = match output_dir.as_deref() {
+                Some(dir) => Some(Path::new(dir).join(relative_subdir(&subdir)?)),
+                None => None,
+            };
+            output_path_for_stem(&app, &input_path, out_dir.as_deref(), &out_stem, &format)
                 .map(|path| unique_output_path(path, &mut taken))
         });
 
-        let file_result = match planned {
-            Err(message) => BatchFileResult::Error { message },
-            Ok(output_path) => {
-                let app = app.clone();
-                let model_path = model_path.clone();
-                let raw_input_path = raw_input_path.clone();
-                let format = format.clone();
-                let options = options.clone();
-                let outcome = tauri::async_runtime::spawn_blocking(
-                    move || -> Result<(PathBuf, String), String> {
-                        let original = open_image(&app, &raw_input_path)?;
-                        let inference = app.state::<InferenceState>();
-                        let mut result = bg_remove::remove_background(
-                            inference.inner(),
-                            spec,
-                            &model_path,
-                            &original,
-                        )?;
-                        if compositing {
-                            result = background::composite(
-                                &result,
-                                options.background_hex.as_deref(),
-                                options.shadow.as_ref(),
-                            )?;
-                        }
-                        write_output(&result, &output_path, &format)?;
-                        publish_to_gallery(&app, &output_path, &format);
-                        let after_data_url = to_data_url_sized(
-                            &DynamicImage::ImageRgba8(result),
-                            BATCH_THUMB_MAX_DIM,
-                        )?;
-                        Ok((output_path, after_data_url))
-                    },
-                )
-                .await
-                .map_err(|e| format!("background task failed: {e}"));
-
-                match outcome {
-                    Ok(Ok((output_path, after_data_url))) => BatchFileResult::Done {
-                        output_path: output_path.display().to_string(),
-                        after_data_url,
-                    },
-                    Ok(Err(message)) | Err(message) => BatchFileResult::Error { message },
-                }
+        let output_path = match planned {
+            Ok(path) => path,
+            Err(message) => {
+                processed += 1;
+                emit(position, file_name, BatchFileResult::Error { message });
+                continue;
             }
         };
 
-        processed += 1;
-        let _ = app.emit(
-            "batch-progress",
-            BatchProgressEvent {
-                index: position,
-                total,
-                file_name,
-                result: file_result,
-            },
-        );
+        let app = app.clone();
+        let model_path = model_path.clone();
+        let format = format.clone();
+        let options = options.clone();
+        running.spawn_blocking(move || {
+            let outcome = (|| -> Result<(PathBuf, String), String> {
+                let original = open_image(&app, &raw_input_path)?;
+                let inference = app.state::<InferenceState>();
+                let mut result = bg_remove::remove_background_parallel(
+                    inference.inner(),
+                    spec,
+                    &model_path,
+                    &original,
+                    parallel,
+                )?;
+                if compositing {
+                    result = background::composite(
+                        &result,
+                        options.background_hex.as_deref(),
+                        options.shadow.as_ref(),
+                    )?;
+                }
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        format!("could not create folder {}: {e}", parent.display())
+                    })?;
+                }
+                write_output(&result, &output_path, &format)?;
+                publish_to_gallery(&app, &output_path, &format);
+                let after_data_url =
+                    to_data_url_sized(&DynamicImage::ImageRgba8(result), BATCH_THUMB_MAX_DIM)?;
+                Ok((output_path, after_data_url))
+            })();
+            let result = match outcome {
+                Ok((output_path, after_data_url)) => BatchFileResult::Done {
+                    output_path: output_path.display().to_string(),
+                    after_data_url,
+                },
+                Err(message) => BatchFileResult::Error { message },
+            };
+            (position, file_name, result)
+        });
+    }
+
+    // Let whatever is already running finish (also after a cancel: those
+    // files are part-way through and their results are worth keeping).
+    while let Some(joined) = running.join_next().await {
+        match joined {
+            Ok((position, file_name, result)) => {
+                processed += 1;
+                emit(position, file_name, result);
+            }
+            Err(e) => return Err(format!("background task failed: {e}")),
+        }
     }
 
     Ok(BatchSummary { processed, cancelled })
@@ -831,11 +930,22 @@ fn unique_zip_entry_name(name: &str, used: &mut HashSet<String>) -> String {
 /// in the batch list rather than a silently skipped file.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"];
 
-/// Expands any directories in `paths` into the image files directly inside
-/// them (non-recursive, sorted by name), leaving file paths untouched.
+/// Expands any directories in `paths` into the image files inside them,
+/// leaving file paths untouched. Without `recursive` only the files
+/// directly inside each folder are taken; with it, every subfolder is
+/// searched too (each folder's own files first, then its subfolders, all
+/// sorted by name). Symlinked/junctioned subfolders are not followed, so a
+/// link loop can't hang the scan, and a subfolder that can't be read (say,
+/// `System Volume Information` at a drive root) is skipped rather than
+/// failing the batch. `skip_dir` is never searched.
 /// This lets the frontend hand a dropped or picked folder straight to the
 /// batch command without needing its own filesystem access.
-fn expand_paths(paths: &[String]) -> Result<Vec<String>, String> {
+fn expand_paths(
+    paths: &[String],
+    recursive: bool,
+    skip_dir: Option<&Path>,
+) -> Result<Vec<BatchInput>, String> {
+    let skip_dir = skip_dir.and_then(|dir| dir.canonicalize().ok());
     let mut expanded = Vec::new();
     for raw_path in paths {
         // A `content://` (Android picker) or other URI-scheme source isn't a
@@ -843,7 +953,7 @@ fn expand_paths(paths: &[String]) -> Result<Vec<String>, String> {
         // only be a single file, and `open_image` reads it through the fs
         // plugin's ContentResolver, so pass it through untouched.
         if raw_path.contains("://") {
-            expanded.push(raw_path.clone());
+            expanded.push(BatchInput { path: raw_path.clone(), subdir: String::new() });
             continue;
         }
         let path = Path::new(raw_path);
@@ -852,25 +962,83 @@ fn expand_paths(paths: &[String]) -> Result<Vec<String>, String> {
             .map_err(|e| format!("could not access {}: {e}", path.display()))?;
 
         if metadata.is_dir() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-                .map_err(|e| format!("could not read folder {}: {e}", path.display()))?
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-                            .unwrap_or(false)
-                })
-                .collect();
-            entries.sort();
-            expanded.extend(entries.into_iter().map(|p| p.display().to_string()));
+            let entries = std::fs::read_dir(path)
+                .map_err(|e| format!("could not read folder {}: {e}", path.display()))?;
+            collect_images(path, path, entries, recursive, skip_dir.as_deref(), &mut expanded);
         } else {
-            expanded.push(raw_path.clone());
+            expanded.push(BatchInput { path: raw_path.clone(), subdir: String::new() });
         }
     }
     Ok(expanded)
+}
+
+/// Adds the image files among `entries` (the contents of `dir`, somewhere
+/// under the folder `root`) to `out`, then - if `recursive` - those of each
+/// subfolder in turn.
+fn collect_images(
+    root: &Path,
+    dir: &Path,
+    entries: std::fs::ReadDir,
+    recursive: bool,
+    skip_dir: Option<&Path>,
+    out: &mut Vec<BatchInput>,
+) {
+    let mut files = Vec::new();
+    let mut subfolders = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let p = entry.path();
+        // `DirEntry::file_type` doesn't follow links, so a symlink or
+        // junction to a folder is neither `is_dir` here nor recursed into.
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_real_dir {
+            if recursive {
+                subfolders.push(p);
+            }
+        } else if p.is_file()
+            && p.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+                .unwrap_or(false)
+        {
+            files.push(p);
+        }
+    }
+    files.sort();
+    subfolders.sort();
+
+    let subdir = dir
+        .strip_prefix(root)
+        .map(|rel| rel.display().to_string())
+        .unwrap_or_default();
+    out.extend(files.into_iter().map(|p| BatchInput {
+        path: p.display().to_string(),
+        subdir: subdir.clone(),
+    }));
+
+    for folder in subfolders {
+        if let Some(skip) = skip_dir {
+            if folder.canonicalize().map(|c| c == skip).unwrap_or(false) {
+                continue;
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&folder) {
+            collect_images(root, &folder, entries, recursive, skip_dir, out);
+        }
+    }
+}
+
+/// `subdir` as a relative path that can only point *below* the output
+/// folder: a `..`, a root or a drive prefix is refused.
+fn relative_subdir(subdir: &str) -> Result<PathBuf, String> {
+    let path = Path::new(subdir);
+    if path
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    {
+        Ok(path.to_path_buf())
+    } else {
+        Err(format!("invalid subfolder: {subdir}"))
+    }
 }
 
 /// Resolves where a processed image should be written: into `output_dir` if
@@ -887,7 +1055,13 @@ fn output_path_for(
     format: &str,
 ) -> Result<PathBuf, String> {
     let stem = source_stem(input_path)?;
-    output_path_for_stem(app, input_path, output_dir, &format!("{stem}{suffix}"), format)
+    output_path_for_stem(
+        app,
+        input_path,
+        output_dir.map(Path::new),
+        &format!("{stem}{suffix}"),
+        format,
+    )
 }
 
 /// The source file's name without its extension.
@@ -903,14 +1077,14 @@ fn source_stem(input_path: &Path) -> Result<String, String> {
 fn output_path_for_stem(
     app: &AppHandle,
     input_path: &Path,
-    output_dir: Option<&str>,
+    output_dir: Option<&Path>,
     file_stem: &str,
     format: &str,
 ) -> Result<PathBuf, String> {
     let file_name = format!("{file_stem}.{format}");
 
     let dir = match output_dir {
-        Some(dir) => PathBuf::from(dir),
+        Some(dir) => dir.to_path_buf(),
         None => match input_path.parent() {
             // A real, existing directory next to the source file - the
             // normal desktop case.
@@ -1211,7 +1385,60 @@ mod tests {
     #[test]
     fn expand_paths_passes_content_uris_through() {
         let uri = "content://media/picker_get_content/0/com.android.providers.media.photopicker/media/1000882056".to_string();
-        assert_eq!(expand_paths(&[uri.clone()]).unwrap(), vec![uri]);
+        assert_eq!(
+            expand_paths(&[uri.clone()], true, None).unwrap(),
+            vec![BatchInput { path: uri, subdir: String::new() }]
+        );
+    }
+
+    #[test]
+    fn expand_paths_recurses_and_reports_each_files_subfolder() {
+        let root = std::env::temp_dir().join(format!(
+            "unbagrnd-recurse-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let deep = root.join("b").join("c");
+        let out = root.join("out");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        for f in ["top.png", "notes.txt", "a/one.JPG", "b/c/two.webp", "out/old-nobg.png"] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        let root_str = root.display().to_string();
+
+        let flat = expand_paths(&[root_str.clone()], false, None).unwrap();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].subdir, "");
+
+        let found = expand_paths(&[root_str], true, Some(&out)).unwrap();
+        let got: Vec<(PathBuf, PathBuf)> = found
+            .iter()
+            .map(|i| (PathBuf::from(&i.path), PathBuf::from(&i.subdir)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (root.join("top.png"), PathBuf::new()),
+                (root.join("a").join("one.JPG"), PathBuf::from("a")),
+                (deep.join("two.webp"), PathBuf::from("b").join("c")),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_subdir_stays_below_the_output_folder() {
+        assert_eq!(relative_subdir("").unwrap(), PathBuf::new());
+        assert_eq!(relative_subdir("a/b").unwrap(), PathBuf::from("a/b"));
+        for bad in ["..", "a/../../b", "/abs"] {
+            assert!(relative_subdir(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]
